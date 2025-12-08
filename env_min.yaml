@@ -1,4 +1,4 @@
-name: classy_yarp
+name: yarp
 channels:
   - conda-forge
   - pytorch
