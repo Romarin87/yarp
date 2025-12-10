@@ -12,9 +12,10 @@ Mimics the flow in tests/tutorial/enumeration_tutorial.py:
 import argparse
 import csv
 import time
+import pickle
+from itertools import repeat
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
-from itertools import repeat
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 import yarp as yp
@@ -34,9 +35,10 @@ BOND_TYPE = {
 class RunLogger:
     """同时写文件和 stdout 的简单日志器。"""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, append: bool = False):
         self.path = path
-        self.handle = open(path, "w", encoding="utf-8")
+        mode = "a" if append else "w"
+        self.handle = open(path, mode, encoding="utf-8")
 
     def log(self, msg: str) -> None:
         line = f"[{datetime.now().isoformat(timespec='seconds')}] {msg}"
@@ -110,6 +112,13 @@ def build_seeds(raw: Iterable[str]) -> List[yp.yarpecule]:
     return seeds
 
 
+def filter_seeds_by_score(seeds: Sequence[yp.yarpecule], score_thresh: Optional[float]) -> List[yp.yarpecule]:
+    """过滤掉 bond_mat_scores[0] 高于阈值的初始种子。"""
+    if score_thresh is None:
+        return list(seeds)
+    return [y for y in seeds if y.bond_mat_scores[0] <= score_thresh]
+
+
 def _break_bonds_worker(parent: yp.yarpecule, n_break: int) -> List[yp.yarpecule]:
     """单个分子的断键阶段（本地去重），供并行 map 使用。"""
     mids: List[yp.yarpecule] = []
@@ -145,6 +154,7 @@ def enumerate_reaction_mode(
     intra: bool = True,
     score_thresh: float = None,
     max_iter: int = None,
+    action_prefix: str = "",
     product_hashes: Optional[Set[float]] = None,
     reaction_pairs: Optional[Set[Tuple[float, float]]] = None,
     mapped_cache: Optional[Dict[float, str]] = None,
@@ -191,7 +201,8 @@ def enumerate_reaction_mode(
         if max_iter is not None and iter_idx >= max_iter:
             break
         iter_idx += 1
-        action_label = f"cycle{iter_idx}_b{n_break}_f{n_form}"
+        prefix = action_prefix or ""
+        action_label = f"{prefix}b{n_break}_f{n_form}"
 
         # 1) 断键阶段（仅用于生成中间体，不计入最终产品集合）
         intermediates: List[Tuple[yp.yarpecule, yp.yarpecule]] = []
@@ -286,6 +297,7 @@ def enumerate_reaction_mode_by_seed(
     intra: bool = True,
     score_thresh: float = None,
     max_iter: int = None,
+    action_prefix: str = "",
     product_hashes: Optional[Set[float]] = None,
     reaction_pairs: Optional[Set[Tuple[float, float]]] = None,
     mapped_cache: Optional[Dict[float, str]] = None,
@@ -319,6 +331,7 @@ def enumerate_reaction_mode_by_seed(
             intra=intra,
             score_thresh=score_thresh,
             max_iter=max_iter,
+            action_prefix=action_prefix,
             product_hashes=product_hashes,
             reaction_pairs=reaction_pairs,
             mapped_cache=mapped_cache,
@@ -358,7 +371,8 @@ def enumerate_reaction_mode_by_seed(
             if max_iter is not None and iter_idx >= max_iter:
                 break
             iter_idx += 1
-            action_label = f"cycle{iter_idx}_b{n_break}_f{n_form}"
+            prefix = action_prefix or ""
+            action_label = f"{prefix}b{n_break}_f{n_form}"
 
             # 1) 断键阶段：并行生成，主进程用 mid_hashes 做跨 parent 去重
             if allow_break and n_break > 0:
@@ -461,6 +475,33 @@ def write_edges(path: str, edges: List[Tuple[float, float, str]], mapped_cache: 
             writer.writerow([parent, mapped_cache[parent], score_cache[parent], child, mapped_cache[child], score_cache[child], action])
 
 
+def save_checkpoint(
+    path: str,
+    state: dict,
+    products: List[yp.yarpecule],
+    edges: List[Tuple[float, float, str]],
+    mapped_cache: dict,
+    score_cache: dict,
+    prod_path: str,
+    edge_path: str,
+    logger: Optional[RunLogger] = None,
+) -> None:
+    """保存当前运行状态与 CSV，使得可从该点续算。"""
+    write_products(prod_path, products, mapped_cache, score_cache)
+    write_edges(edge_path, edges, mapped_cache, score_cache)
+    if logger:
+        state["log_path"] = getattr(logger, "path", None)
+    with open(path, "wb") as f:
+        pickle.dump(state, f)
+    if logger:
+        logger.log(f"[checkpoint] saved to {path}")
+
+
+def load_checkpoint(path: str) -> dict:
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
 def build_reaction_modes(n_break: int, n_form: int, max_break: int = None, max_form: int = None) -> List[Tuple[int, int]]:
     """
     返回需要执行的 (n_break, n_form) 组合。
@@ -498,47 +539,130 @@ def enumerate_reaction_modes(
     max_depth: int = None,
     logger: Optional[RunLogger] = None,
     num_workers: int = 1,
+    checkpoint_path: Optional[str] = None,
+    resume_state: Optional[dict] = None,
+    prod_path: Optional[str] = None,
+    edge_path: Optional[str] = None,
 ) -> Tuple[List[yp.yarpecule], List[Tuple[float, float, str]], dict, dict]:
     """
     按反应深度分层：每一层对 frontier 依次执行所有 (n_break, n_form) 组合，每个组合在该层只跑一轮（内部 max_iter=1）。
     跨组合共享反应/产物去重；返回累积的唯一分子、全部去重后的反应边以及缓存。
     num_workers>1 时，单个 (n_break, n_form) 组合内部会按 seed 并行。
     """
-    product_hashes: Set[float] = {y.hash for y in seeds}
-    reaction_pairs: Set[Tuple[float, float]] = set()
-    mapped_cache: Dict[float, str] = {y.hash: yarpecule_to_mapped_smiles(y) for y in seeds}
-    score_cache: Dict[float, float] = {y.hash: y.bond_mat_scores[0] for y in seeds}
-    products: List[yp.yarpecule] = list(seeds)
-    edges: List[Tuple[float, float, str]] = []
-    frontier: List[yp.yarpecule] = list(seeds)
-    depth = 0
+    if resume_state:
+        product_hashes = resume_state["product_hashes"]
+        reaction_pairs = resume_state["reaction_pairs"]
+        mapped_cache = resume_state["mapped_cache"]
+        score_cache = resume_state["score_cache"]
+        products = resume_state["products"]
+        edges = resume_state["edges"]
+        frontier = resume_state["frontier"]
+        depth_new = resume_state["depth_new"]
+        depth = resume_state["depth"]
+        mode_idx = resume_state["mode_idx"]
+        depth_frontier = resume_state["depth_frontier"]
+        if logger:
+            logger.log(f"[resume] depth={depth} mode_idx={mode_idx} frontier={len(frontier)} depth_new={len(depth_new)}")
+            if resume_state.get("score_thresh") != score_thresh:
+                logger.log(f"[resume warning] score_thresh mismatch: checkpoint {resume_state.get('score_thresh')} vs current {score_thresh}")
+    else:
+        seed_list = filter_seeds_by_score(seeds, score_thresh)
+        if logger and score_thresh is not None and len(seed_list) != len(seeds):
+            logger.log(f"[filter] seeds by score_thresh={score_thresh}: kept {len(seed_list)} / {len(seeds)}")
+        if not seed_list:
+            return [], [], {}, {}
+        product_hashes: Set[float] = {y.hash for y in seed_list}
+        reaction_pairs: Set[Tuple[float, float]] = set()
+        mapped_cache: Dict[float, str] = {y.hash: yarpecule_to_mapped_smiles(y) for y in seed_list}
+        score_cache: Dict[float, float] = {y.hash: y.bond_mat_scores[0] for y in seed_list}
+        products: List[yp.yarpecule] = list(seed_list)
+        edges: List[Tuple[float, float, str]] = []
+        frontier: List[yp.yarpecule] = list(seed_list)
+        depth_new: List[yp.yarpecule] = []
+        depth = 0
+        mode_idx = 0
+        depth_frontier = list(frontier)
+        if logger:
+            logger.log("-" * 8 + f" depth {depth + 1} " + "-" * 8)
 
     while frontier and (max_depth is None or depth < max_depth):
-        depth += 1
-        depth_new: List[yp.yarpecule] = []
-        if logger:
-            logger.log("-" * 8 + f" depth {depth} " + "-" * 8)
-        for n_break, n_form in reaction_modes:
-            run_products, run_edges, mapped_cache, score_cache = enumerate_reaction_mode_by_seed(
-                frontier,
-                n_break=n_break,
-                n_form=n_form,
-                allow_break=allow_break,
-                inter=inter,
-                intra=intra,
-                score_thresh=score_thresh,
-                max_iter=1,  # 每层每个模式只跑一轮
-                product_hashes=product_hashes,
-                reaction_pairs=reaction_pairs,
-                mapped_cache=mapped_cache,
-                score_cache=score_cache,
+        if mode_idx >= len(reaction_modes):
+            frontier = depth_new
+            depth_new = []
+            depth += 1
+            mode_idx = 0
+            depth_frontier = list(frontier)
+            if not frontier or (max_depth is not None and depth >= max_depth):
+                break
+            if logger:
+                logger.log("-" * 8 + f" depth {depth} " + "-" * 8)
+        if not frontier:
+            break
+
+        n_break, n_form = reaction_modes[mode_idx]
+        depth_idx = depth + 1
+        run_products, run_edges, mapped_cache, score_cache = enumerate_reaction_mode_by_seed(
+            depth_frontier,
+            n_break=n_break,
+            n_form=n_form,
+            allow_break=allow_break,
+            inter=inter,
+            intra=intra,
+            score_thresh=score_thresh,
+            max_iter=1,
+            action_prefix=f"Depth{depth_idx}_",
+            product_hashes=product_hashes,
+            reaction_pairs=reaction_pairs,
+            mapped_cache=mapped_cache,
+            score_cache=score_cache,
+            logger=logger,
+            num_workers=num_workers,
+        )
+        products.extend(run_products)
+        edges.extend(run_edges)
+        depth_new.extend(run_products)
+        mode_idx += 1
+
+        # 不中断也写入当前 CSV，便于中途查看/防崩溃丢失（checkpoint 分支已写）
+        if prod_path and edge_path and not checkpoint_path:
+            write_products(prod_path, products, mapped_cache, score_cache)
+            write_edges(edge_path, edges, mapped_cache, score_cache)
+
+        if checkpoint_path and prod_path and edge_path:
+            state = {
+                "product_hashes": product_hashes,
+                "reaction_pairs": reaction_pairs,
+                "mapped_cache": mapped_cache,
+                "score_cache": score_cache,
+                "products": products,
+                "edges": edges,
+                "frontier": frontier,
+                "depth_new": depth_new,
+                "depth": depth,
+                "mode_idx": mode_idx,
+                "depth_frontier": depth_frontier,
+                "reaction_modes": reaction_modes,
+                "allow_break": allow_break,
+                "inter": inter,
+                "intra": intra,
+                "score_thresh": score_thresh,
+                "max_depth": max_depth,
+                "num_workers": num_workers,
+                "prod_path": prod_path,
+                "edge_path": edge_path,
+                "seeds_raw": seeds,
+            }
+            save_checkpoint(
+                checkpoint_path,
+                state,
+                products,
+                edges,
+                mapped_cache,
+                score_cache,
+                prod_path,
+                edge_path,
                 logger=logger,
-                num_workers=num_workers,
             )
-            products.extend(run_products)
-            edges.extend(run_edges)
-            depth_new.extend(run_products)
-        frontier = depth_new
 
     return products, edges, mapped_cache, score_cache
 
@@ -554,34 +678,69 @@ def main() -> None:
     parser.add_argument("--no-break", action="store_true", help="禁用断键阶段。")
     parser.add_argument("--no-inter", action="store_true", default=False, help="禁用分子间成键（默认允许）")
     parser.add_argument("--no-intra", action="store_true", default=False, help="禁用分子内成键（默认允许分子内成键）")
-    parser.add_argument("--score-thresh", type=float, default=0.0, help="过滤 bond_mat_scores[0] 超过阈值的结构。")
+    parser.add_argument("--score-thresh", type=float, default=0.5, help="过滤 bond_mat_scores[0] 超过阈值的结构。")
     parser.add_argument("--out-prefix", default="run1", help="输出前缀（默认 run）。")
     parser.add_argument("--log-file", default=None, help="日志文件路径（默认 {out_prefix}.log）。")
     parser.add_argument("--num-workers", type=int, default=1, help="并行核数（默认 1，表示不并行）。并行按 seed 颗粒度。")
+    parser.add_argument("--checkpoint-path", default=None, help="checkpoint 文件路径，设置后每完成一个 mode 自动保存。")
+    parser.add_argument("--resume", default=None, help="从 checkpoint 续算的路径。")
     args = parser.parse_args()
 
-    seeds = build_seeds(args.seed)
-    reaction_modes = build_reaction_modes(args.n_break, args.n_form, args.max_break, args.max_form)
-    log_path = args.log_file or f"{args.out_prefix}.log"
-    logger = RunLogger(log_path)
+    prod_path = f"{args.out_prefix}_products.csv"
+    edge_path = f"{args.out_prefix}_edges.csv"
+
+    if args.resume:
+        resume_state = load_checkpoint(args.resume)
+        reaction_modes = resume_state["reaction_modes"]
+        seeds = resume_state.get("seeds_raw", [])
+        prod_path = resume_state.get("prod_path", prod_path)
+        edge_path = resume_state.get("edge_path", edge_path)
+        log_path = resume_state.get("log_path") or args.log_file or f"{args.out_prefix}.log"
+        logger = RunLogger(log_path, append=True)
+        logger.log(f"[resume] from {args.resume}")
+        # 重写 CSV 以便续写
+        write_products(prod_path, resume_state["products"], resume_state["mapped_cache"], resume_state["score_cache"])
+        write_edges(edge_path, resume_state["edges"], resume_state["mapped_cache"], resume_state["score_cache"])
+        allow_break = resume_state.get("allow_break", not args.no_break)
+        inter = resume_state.get("inter", not args.no_inter)
+        intra = resume_state.get("intra", not args.no_intra)
+        score_thresh = resume_state.get("score_thresh", args.score_thresh)
+        max_depth = resume_state.get("max_depth", args.max_depth)
+        num_workers = resume_state.get("num_workers", args.num_workers)
+    else:
+        seeds = build_seeds(args.seed)
+        reaction_modes = build_reaction_modes(args.n_break, args.n_form, args.max_break, args.max_form)
+        log_path = args.log_file or f"{args.out_prefix}.log"
+        logger = RunLogger(log_path)
+        resume_state = None
+        allow_break = not args.no_break
+        inter = not args.no_inter
+        intra = not args.no_intra
+        score_thresh = args.score_thresh
+        max_depth = args.max_depth
+        num_workers = args.num_workers
+
     run_start = time.time()
     try:
-        logger.log(f"Start enumeration | seeds={len(seeds)} | modes={', '.join(f'b{b}f{f}' for b, f in reaction_modes)} | allow_break={not args.no_break} inter={not args.no_inter} intra={not args.no_intra} score_thresh={args.score_thresh} max_depth={args.max_depth}")
+        if not args.resume:
+            logger.log(f"Start enumeration | seeds={len(seeds)} | modes={', '.join(f'b{b}f{f}' for b, f in reaction_modes)} | allow_break={allow_break} inter={inter} intra={intra} score_thresh={score_thresh} max_depth={max_depth}")
 
         products, edges, mapped_cache, score_cache = enumerate_reaction_modes(
             seeds,
             reaction_modes,
-            allow_break=not args.no_break,
-            inter=not args.no_inter,
-            intra=not args.no_intra,
-            score_thresh=args.score_thresh,
-            max_depth=args.max_depth,
+            allow_break=allow_break,
+            inter=inter,
+            intra=intra,
+            score_thresh=score_thresh,
+            max_depth=max_depth,
             logger=logger,
-            num_workers=args.num_workers,
+            num_workers=num_workers,
+            checkpoint_path=args.checkpoint_path,
+            resume_state=resume_state,
+            prod_path=prod_path,
+            edge_path=edge_path,
         )
 
-        prod_path = f"{args.out_prefix}_products.csv"
-        edge_path = f"{args.out_prefix}_edges.csv"
         write_products(prod_path, products, mapped_cache, score_cache)
         write_edges(edge_path, edges, mapped_cache, score_cache)
 
