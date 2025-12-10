@@ -20,11 +20,11 @@ git clone https://github.com/Savoie-Research-Group/yarp.git
 * 1.2 Build the YARP environment and install required packages by:
 ```
 cd yarp
-conda env create -f env_linux.yaml
+conda env create -f env_min.yaml
 ```
 * 1.3 Install yarp package by:
 ```
-conda activate classy-yarp
+conda activate yarp
 pip install .
 ```
 * 1.4 Create pysis cmd by:
@@ -97,3 +97,8 @@ More details could be found in `parameters.yaml`.
 ```
 python main_xtb.py [your parameter yaml file]
 ```
+
+# 4. Reaction enumeration helper (`enumerate_rxn_worker.py`)
+* CLI script for break/form enumeration; outputs atom-mapped SMILES and reaction edges (CSV).
+* Supports per-seed parallelism via `--num-workers N` (tasks up to the current seed count; dedup logic matches serial behavior).
+* Example: `python enumerate_rxn_worker.py "CCO" --n-break 1 --n-form 0 --num-workers 4 --out-prefix run_demo`
