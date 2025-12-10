@@ -103,7 +103,10 @@ def build_seeds(raw: Iterable[str]) -> List[yp.yarpecule]:
         if isinstance(item, yp.yarpecule):
             seeds.append(item)
         else:
-            seeds.append(yp.yarpecule(item, canon=False))
+            try:
+                seeds.append(yp.yarpecule(item, canon=False))
+            except Exception as e:
+                raise ValueError(f"Failed to build yarpecule from input '{item}': {e}")
     return seeds
 
 
