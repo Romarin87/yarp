@@ -11,8 +11,10 @@ Mimics the flow in tests/tutorial/enumeration_tutorial.py:
 
 import argparse
 import csv
-import time
+import os
 import pickle
+import subprocess
+import time
 from itertools import repeat
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
@@ -48,6 +50,23 @@ class RunLogger:
 
     def close(self) -> None:
         self.handle.close()
+
+
+def get_process_rss_mb() -> Optional[float]:
+    """返回当前进程的常驻集大小（MB）；尽量不用外部依赖。"""
+    try:
+        import psutil  # type: ignore
+
+        return psutil.Process().memory_info().rss / (1024**2)
+    except Exception:
+        try:
+            output = subprocess.check_output(
+                ["ps", "-o", "rss=", "-p", str(os.getpid())], text=True
+            )
+            rss_kb = float(output.strip())
+            return rss_kb / 1024
+        except Exception:
+            return None
 
 
 def yarpecule_to_mapped_smiles(y: yp.yarpecule) -> str:
@@ -160,6 +179,8 @@ def enumerate_reaction_mode(
     mapped_cache: Optional[Dict[float, str]] = None,
     score_cache: Optional[Dict[float, float]] = None,
     logger: Optional[RunLogger] = None,
+    num_workers: int = 1,
+    batch_size: Optional[int] = None,
 ) -> Tuple[List[yp.yarpecule], List[Tuple[float, float, str]], dict]:
     """
     单一 (n_break, n_form) 组合的断键/成键枚举。
@@ -178,6 +199,8 @@ def enumerate_reaction_mode(
     reaction_pairs = reaction_pairs if reaction_pairs is not None else set()  # 存储无向反应端点，避免重复计入同一反应
     mapped_cache = mapped_cache if mapped_cache is not None else {}
     score_cache = score_cache if score_cache is not None else {}
+    product_count_before = len(product_hashes)
+    edge_count_before = len(reaction_pairs)
     products: List[yp.yarpecule] = []
     for y in seeds:
         if y.hash not in product_hashes:
@@ -194,7 +217,9 @@ def enumerate_reaction_mode(
 
     if logger:
         logger.log("-" * 12 + f" b{n_break}f{n_form} " + "-" * 12)
-        logger.log(f"[b{n_break}f{n_form}] start | seeds={len(seeds)}")
+        logger.log(
+            f"[b{n_break}f{n_form}] start (serial) | seeds={len(seeds)}"
+        )
     mode_start = time.time()
 
     while parents:
@@ -283,7 +308,15 @@ def enumerate_reaction_mode(
 
     if logger:
         elapsed = time.time() - mode_start
-        logger.log(f"[b{n_break}f{n_form}] done | +{len(products)} products | +{len(edges)} edges | elapsed={elapsed:.2f}s")
+        total_products = len(product_hashes)
+        total_edges = len(reaction_pairs)
+        delta_products = total_products - product_count_before
+        delta_edges = total_edges - edge_count_before
+        mem_used = get_process_rss_mb()
+        mem_str = f"{mem_used:.1f} MB" if mem_used is not None else "n/a"
+        logger.log(
+            f"[b{n_break}f{n_form}] done | {total_products} (+{delta_products}) products | {total_edges} (+{delta_edges}) edges | mem used={mem_str} | elapsed={elapsed:.2f}s"
+        )
 
     return products, edges, mapped_cache, score_cache
 
@@ -303,11 +336,12 @@ def enumerate_reaction_mode_by_seed(
     mapped_cache: Optional[Dict[float, str]] = None,
     score_cache: Optional[Dict[float, float]] = None,
     num_workers: int = 1,
+    batch_size: Optional[int] = None,
     logger: Optional[RunLogger] = None,
 ) -> Tuple[List[yp.yarpecule], List[Tuple[float, float, str]], dict]:
     """
     map-reduce 模式：并行生成候选，在主进程去重/过滤，保证与串行相同的去重结果。
-    num_workers<=1 时退化为原有的 enumerate_reaction_mode。
+    num_workers<=1 时退化为原有的 enumerate_reaction_mode；batch_size 默认等于 num_workers。
     """
     if num_workers is None or num_workers < 1:
         num_workers = 1
@@ -337,17 +371,26 @@ def enumerate_reaction_mode_by_seed(
             mapped_cache=mapped_cache,
             score_cache=score_cache,
             logger=logger,
+            num_workers=num_workers,
+            batch_size=batch_size,
         )
+
+    effective_batch_size = batch_size if batch_size and batch_size > 0 else num_workers
+    if effective_batch_size is None or effective_batch_size < 1:
+        effective_batch_size = 1
 
     if logger:
         logger.log("-" * 12 + f" b{n_break}f{n_form} " + "-" * 12)
-        logger.log(f"[b{n_break}f{n_form}] start | seeds={len(seed_objs)} | workers={num_workers}")
-        logger.log(f"[b{n_break}f{n_form}] parallel map-reduce | seeds={len(seed_objs)} | workers={num_workers}")
+        logger.log(
+            f"[b{n_break}f{n_form}] start (parallel map-reduce) | seeds={len(seed_objs)} | workers={num_workers} | batch_size={effective_batch_size}"
+        )
 
     product_hashes = product_hashes if product_hashes is not None else set()
     reaction_pairs = reaction_pairs if reaction_pairs is not None else set()
     mapped_cache = mapped_cache if mapped_cache is not None else {}
     score_cache = score_cache if score_cache is not None else {}
+    product_count_before = len(product_hashes)
+    edge_count_before = len(reaction_pairs)
     mode_start = time.time()
 
     products: List[yp.yarpecule] = []
@@ -376,20 +419,22 @@ def enumerate_reaction_mode_by_seed(
 
             # 1) 断键阶段：并行生成，主进程用 mid_hashes 做跨 parent 去重
             if allow_break and n_break > 0:
-                break_results = list(executor.map(_break_bonds_worker, parents, repeat(n_break)))
                 intermediates: List[Tuple[yp.yarpecule, yp.yarpecule]] = []
                 mid_hashes = set()
-                for parent, mids in zip(parents, break_results):
-                    added = False
-                    if mids:
-                        for mid in mids:
-                            if mid.hash in mid_hashes:
-                                continue
-                            mid_hashes.add(mid.hash)
-                            intermediates.append((parent, mid))
-                            added = True
-                    if not mids or not added:
-                        intermediates.append((parent, parent))
+                for start_idx in range(0, len(parents), effective_batch_size):
+                    batch_parents = parents[start_idx : start_idx + effective_batch_size]
+                    break_results = executor.map(_break_bonds_worker, batch_parents, repeat(n_break))
+                    for parent, mids in zip(batch_parents, break_results):
+                        added = False
+                        if mids:
+                            for mid in mids:
+                                if mid.hash in mid_hashes:
+                                    continue
+                                mid_hashes.add(mid.hash)
+                                intermediates.append((parent, mid))
+                                added = True
+                        if not mids or not added:
+                            intermediates.append((parent, parent))
             else:
                 intermediates = [(p, p) for p in parents]
 
@@ -401,16 +446,18 @@ def enumerate_reaction_mode_by_seed(
             for _ in range(max(n_form, 0)):
                 if not frontier:
                     break
-                mols = [mol for _, mol in frontier]
-                form_results = list(executor.map(_form_bonds_worker, mols, repeat(inter), repeat(intra)))
                 step_hashes = set()
                 next_frontier: List[Tuple[yp.yarpecule, yp.yarpecule]] = []
-                for (origin, _), prods in zip(frontier, form_results):
-                    for prod in prods:
-                        if prod.hash in step_hashes:
-                            continue
-                        step_hashes.add(prod.hash)
-                        next_frontier.append((origin, prod))
+                for start_idx in range(0, len(frontier), effective_batch_size):
+                    batch_frontier = frontier[start_idx : start_idx + effective_batch_size]
+                    mols = [mol for _, mol in batch_frontier]
+                    form_results = executor.map(_form_bonds_worker, mols, repeat(inter), repeat(intra))
+                    for (origin, _), prods in zip(batch_frontier, form_results):
+                        for prod in prods:
+                            if prod.hash in step_hashes:
+                                continue
+                            step_hashes.add(prod.hash)
+                            next_frontier.append((origin, prod))
                 frontier = next_frontier
 
             # 3) 收集本轮结果
@@ -452,8 +499,14 @@ def enumerate_reaction_mode_by_seed(
 
     if logger:
         elapsed = time.time() - mode_start
+        total_products = len(product_hashes)
+        total_edges = len(reaction_pairs)
+        delta_products = total_products - product_count_before
+        delta_edges = total_edges - edge_count_before
+        mem_used = get_process_rss_mb()
+        mem_str = f"{mem_used:.1f} MB" if mem_used is not None else "n/a"
         logger.log(
-            f"[b{n_break}f{n_form}] done | +{len(products)} products | +{len(edges)} edges | workers={num_workers} | elapsed={elapsed:.2f}s"
+            f"[b{n_break}f{n_form}] done | {total_products} (+{delta_products}) products | {total_edges} (+{delta_edges}) edges | mem used={mem_str} | elapsed={elapsed:.2f}s"
         )
 
     return products, edges, mapped_cache, score_cache
@@ -539,6 +592,7 @@ def enumerate_reaction_modes(
     max_depth: int = None,
     logger: Optional[RunLogger] = None,
     num_workers: int = 1,
+    batch_size: Optional[int] = None,
     checkpoint_path: Optional[str] = None,
     resume_state: Optional[dict] = None,
     prod_path: Optional[str] = None,
@@ -547,7 +601,7 @@ def enumerate_reaction_modes(
     """
     按反应深度分层：每一层对 frontier 依次执行所有 (n_break, n_form) 组合，每个组合在该层只跑一轮（内部 max_iter=1）。
     跨组合共享反应/产物去重；返回累积的唯一分子、全部去重后的反应边以及缓存。
-    num_workers>1 时，单个 (n_break, n_form) 组合内部会按 seed 并行。
+    num_workers>1 时，单个 (n_break, n_form) 组合内部会按 seed 并行；batch_size 控制主进程聚合 worker 结果的批量。
     """
     if resume_state:
         product_hashes = resume_state["product_hashes"]
@@ -583,10 +637,12 @@ def enumerate_reaction_modes(
         mode_idx = 0
         depth_frontier = list(frontier)
         if logger:
-            logger.log("-" * 8 + f" depth {depth + 1} " + "-" * 8)
+            logger.log("-" * 8 + f" Depth {depth + 1} " + "-" * 8)
 
     while frontier and (max_depth is None or depth < max_depth):
         if mode_idx >= len(reaction_modes):
+            if logger:
+                logger.log("")  # blank line between depths
             frontier = depth_new
             depth_new = []
             depth += 1
@@ -595,7 +651,7 @@ def enumerate_reaction_modes(
             if not frontier or (max_depth is not None and depth >= max_depth):
                 break
             if logger:
-                logger.log("-" * 8 + f" depth {depth} " + "-" * 8)
+                logger.log("-" * 8 + f" Depth {depth + 1} " + "-" * 8)
         if not frontier:
             break
 
@@ -617,6 +673,7 @@ def enumerate_reaction_modes(
             score_cache=score_cache,
             logger=logger,
             num_workers=num_workers,
+            batch_size=batch_size,
         )
         products.extend(run_products)
         edges.extend(run_edges)
@@ -648,6 +705,7 @@ def enumerate_reaction_modes(
                 "score_thresh": score_thresh,
                 "max_depth": max_depth,
                 "num_workers": num_workers,
+                "batch_size": batch_size,
                 "prod_path": prod_path,
                 "edge_path": edge_path,
                 "seeds_raw": seeds,
@@ -678,10 +736,11 @@ def main() -> None:
     parser.add_argument("--no-break", action="store_true", help="禁用断键阶段。")
     parser.add_argument("--no-inter", action="store_true", default=False, help="禁用分子间成键（默认允许）")
     parser.add_argument("--no-intra", action="store_true", default=False, help="禁用分子内成键（默认允许分子内成键）")
-    parser.add_argument("--score-thresh", type=float, default=0.5, help="过滤 bond_mat_scores[0] 超过阈值的结构。")
+    parser.add_argument("--score-thresh", type=float, default=0.0, help="过滤 bond_mat_scores[0] 超过阈值的结构。")
     parser.add_argument("--out-prefix", default="run1", help="输出前缀（默认 run）。")
     parser.add_argument("--log-file", default=None, help="日志文件路径（默认 {out_prefix}.log）。")
     parser.add_argument("--num-workers", type=int, default=1, help="并行核数（默认 1，表示不并行）。并行按 seed 颗粒度。")
+    parser.add_argument("--batch-size", type=int, default=None, help="聚合 worker 结果时主进程的批量大小（默认等于 --num-workers）。")
     parser.add_argument("--checkpoint-path", default=None, help="checkpoint 文件路径，设置后每完成一个 mode 自动保存。")
     parser.add_argument("--resume", default=None, help="从 checkpoint 续算的路径。")
     args = parser.parse_args()
@@ -707,6 +766,7 @@ def main() -> None:
         score_thresh = resume_state.get("score_thresh", args.score_thresh)
         max_depth = resume_state.get("max_depth", args.max_depth)
         num_workers = resume_state.get("num_workers", args.num_workers)
+        batch_size = resume_state.get("batch_size", args.batch_size if args.batch_size else num_workers)
     else:
         seeds = build_seeds(args.seed)
         reaction_modes = build_reaction_modes(args.n_break, args.n_form, args.max_break, args.max_form)
@@ -719,6 +779,7 @@ def main() -> None:
         score_thresh = args.score_thresh
         max_depth = args.max_depth
         num_workers = args.num_workers
+        batch_size = args.batch_size if args.batch_size else args.num_workers
 
     run_start = time.time()
     try:
@@ -735,6 +796,7 @@ def main() -> None:
             max_depth=max_depth,
             logger=logger,
             num_workers=num_workers,
+            batch_size=batch_size,
             checkpoint_path=args.checkpoint_path,
             resume_state=resume_state,
             prod_path=prod_path,
